@@ -134,11 +134,6 @@ Rcpp::List computePopLDWindow(int chr, long long int start_bp, long long int end
                               std::string reference_index_file, std::string reference_data_file,
                               std::string reference_pop_desc_file, Rcpp::Nullable<double> maf_cutoff,
                               Rcpp::Nullable<double> missing_cutoff);
-Rcpp::List computeSuperPopLDWindow(int chr, long long int start_bp, long long int end_bp,
-                                   std::string superpopulation_label,
-                                   std::string reference_index_file, std::string reference_data_file,
-                                   std::string reference_pop_desc_file, Rcpp::Nullable<double> maf_cutoff,
-                                   Rcpp::Nullable<double> missing_cutoff);
 void UpdateSnpToMinorAllele(std::vector<Snp*>& snp_vec);
 std::vector<std::string> ConvertGenotypesToDominant(const std::vector<std::string>& genoVec);
 std::vector<std::string> ConvertGenotypesToRecessive(const std::vector<std::string>& genoVec);

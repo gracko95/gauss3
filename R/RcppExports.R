@@ -23,27 +23,6 @@ computePopLDWindow <- function(chr, start_bp, end_bp, population_index, referenc
     .Call(`_gauss_computePopLDWindow`, chr, start_bp, end_bp, population_index, reference_index_file, reference_data_file, reference_pop_desc_file, maf_cutoff, missing_cutoff)
 }
 
-#' Compute superpopulation-specific LD for one reference window
-#'
-#' Computes a signed LD correlation matrix for one genomic region and one selected
-#' superpopulation (AFR/AMR/ASN/EUR/SAS) directly from GAUSS 33KG reference files,
-#' without GWAS summary statistics input.
-#'
-#' @param chr Chromosome number.
-#' @param start_bp Start base-pair position of the region.
-#' @param end_bp End base-pair position of the region.
-#' @param superpopulation_label Superpopulation label (e.g. AFR/AMR/ASN/EUR/SAS).
-#' @param reference_index_file Reference panel index file.
-#' @param reference_data_file Reference panel genotype data file.
-#' @param reference_pop_desc_file Reference panel population description file.
-#' @param maf_cutoff Optional MAF threshold. Defaults to 0.01.
-#' @param missing_cutoff Optional missingness threshold in [0,1]. Defaults to 1.0.
-#' @return A list with `snplist` (data frame: rsid, chr, bp, a1, a2, af1pop)
-#'   and `cormat` (signed correlation matrix).
-computeSuperPopLDWindow <- function(chr, start_bp, end_bp, superpopulation_label, reference_index_file, reference_data_file, reference_pop_desc_file, maf_cutoff = NULL, missing_cutoff = NULL) {
-    .Call(`_gauss_computeSuperPopLDWindow`, chr, start_bp, end_bp, superpopulation_label, reference_index_file, reference_data_file, reference_pop_desc_file, maf_cutoff, missing_cutoff)
-}
-
 #' Calculate population weights using RAF
 #' 
 #' @param input_file file name of input data containing rsid, chr, bp, a1, a2, and af1 
