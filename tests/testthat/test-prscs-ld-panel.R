@@ -60,7 +60,7 @@ test_that("generate_prscs_ld_panel writes HDF5 blocks with metadata", {
   expect_true("a1" %in% names(b1))
   expect_true("a2" %in% names(b1))
 
-  ld <- b1[["ld"]][]
+  ld <- b1[["ld"]]$read()
   expect_equal(nrow(ld), ncol(ld))
   expect_true(all(is.finite(ld)))
   if (length(ld) > 0) {

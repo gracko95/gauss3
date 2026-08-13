@@ -121,19 +121,19 @@ generate_prscs_ld_panel <- function(reference_geno_file,
   h5 <- hdf5r::H5File$new(output_h5, mode = "w")
   on.exit(h5$close_all(), add = TRUE)
 
-  h5$attr_open("panel_name")$write(panel_name)
-  h5$attr_open("chr")$write(as.integer(chromosome))
-  h5$attr_open("window_bp")$write(as.integer(window_size))
-  h5$attr_open("step_bp")$write(as.integer(step_size))
-  h5$attr_open("shrinkage_lambda")$write(as.numeric(shrinkage))
-  h5$attr_open("eig_floor")$write(as.numeric(min_eigenvalue))
-  h5$attr_open("maf_min")$write(as.numeric(maf_min))
-  h5$attr_open("missing_max")$write(as.numeric(missing_max))
-  h5$attr_open("n_blocks")$write(as.integer(nrow(windows)))
-  h5$attr_open("n_samples")$write(as.integer(length(population_indices) * .infer_samples_per_population(reference_geno_file, n_reference_populations)))
-  h5$attr_open("n_selected_pops")$write(as.integer(length(population_indices)))
-  h5$attr_open("selected_pops")$write(as.integer(population_indices))
-  h5$attr_open("dosage_allele")$write(dosage_allele)
+  .h5_write_attr(h5, "panel_name", panel_name)
+  .h5_write_attr(h5, "chr", as.integer(chromosome))
+  .h5_write_attr(h5, "window_bp", as.integer(window_size))
+  .h5_write_attr(h5, "step_bp", as.integer(step_size))
+  .h5_write_attr(h5, "shrinkage_lambda", as.numeric(shrinkage))
+  .h5_write_attr(h5, "eig_floor", as.numeric(min_eigenvalue))
+  .h5_write_attr(h5, "maf_min", as.numeric(maf_min))
+  .h5_write_attr(h5, "missing_max", as.numeric(missing_max))
+  .h5_write_attr(h5, "n_blocks", as.integer(nrow(windows)))
+  .h5_write_attr(h5, "n_samples", as.integer(length(population_indices) * .infer_samples_per_population(reference_geno_file, n_reference_populations)))
+  .h5_write_attr(h5, "n_selected_pops", as.integer(length(population_indices)))
+  .h5_write_attr(h5, "selected_pops", as.integer(population_indices))
+  .h5_write_attr(h5, "dosage_allele", dosage_allele)
 
   blocks_group <- h5$create_group("blocks")
 
@@ -150,11 +150,11 @@ generate_prscs_ld_panel <- function(reference_geno_file,
     }
 
     block_group <- blocks_group$create_group(sprintf("block_%s", i))
-    block_group$attr_open("start_bp")$write(as.integer(wstart))
-    block_group$attr_open("end_bp")$write(as.integer(wend))
+    .h5_write_attr(block_group, "start_bp", as.integer(wstart))
+    .h5_write_attr(block_group, "end_bp", as.integer(wend))
 
     if (nrow(block_idx) == 0) {
-      block_group$attr_open("m_snps")$write(as.integer(0))
+      .h5_write_attr(block_group, "m_snps", as.integer(0))
       block_group[["ld"]] <- matrix(numeric(0), nrow = 0, ncol = 0)
       block_group[["rsid"]] <- character(0)
       block_group[["bp"]] <- integer(0)
@@ -175,7 +175,7 @@ generate_prscs_ld_panel <- function(reference_geno_file,
     block_idx <- block_idx[filt$keep, , drop = FALSE]
 
     if (ncol(geno_mat) == 0) {
-      block_group$attr_open("m_snps")$write(as.integer(0))
+      .h5_write_attr(block_group, "m_snps", as.integer(0))
       block_group[["ld"]] <- matrix(numeric(0), nrow = 0, ncol = 0)
       block_group[["rsid"]] <- character(0)
       block_group[["bp"]] <- integer(0)
@@ -188,7 +188,7 @@ generate_prscs_ld_panel <- function(reference_geno_file,
     ld[is.na(ld)] <- 0
     ld <- .shrink_and_make_pd(ld, shrinkage = shrinkage, min_eigenvalue = min_eigenvalue)
 
-    block_group$attr_open("m_snps")$write(as.integer(ncol(geno_mat)))
+    .h5_write_attr(block_group, "m_snps", as.integer(ncol(geno_mat)))
     block_group[["ld"]] <- ld
     block_group[["rsid"]] <- as.character(block_idx$rsid)
     block_group[["bp"]] <- as.integer(block_idx$bp)
@@ -281,6 +281,10 @@ generate_prscs_ld_panel <- function(reference_geno_file,
   if (!is.logical(verbose) || length(verbose) != 1 || is.na(verbose)) {
     stop("'verbose' must be TRUE or FALSE.", call. = FALSE)
   }
+}
+
+.h5_write_attr <- function(h5obj, name, value) {
+  h5obj$create_attr(name, value, dtype = hdf5r::guess_dtype(value))
 }
 
 .read_gauss_index <- function(reference_index_file) {
