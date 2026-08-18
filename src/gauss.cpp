@@ -8,6 +8,7 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
+#include <sys/stat.h>
 #include "util.h"
 #include "bgzf.h"
 #include "snp.h"
@@ -289,113 +290,201 @@ void ReadInputAf(std::map<MapKey, Snp*, LessThanMapKey>& snp_map, Arguments& arg
 //
 // Error Handling:
 //   If duplicates are found in the input or reference files, the function stops with an error message.
+//
+// Performance note:
+//   Callers such as computeSuperPopLDWindow/computePopLDWindow invoke this once per genomic block
+//   (potentially hundreds of times per chromosome) with the same reference_index_file. Re-opening and
+//   re-parsing a multi-GB BGZF file on every call dominated runtime, so the parsed contents are cached
+//   in-process (bucketed by chromosome) the first time a given file path is seen, and reused thereafter.
 
-void ReadReferenceIndex(std::map<MapKey, Snp*, LessThanMapKey>& snp_map, Arguments& args) {
-  
+namespace {
+
+struct RefIndexEntry {
+  std::string rsid;
+  long long int bp;
+  std::string a1, a2;
+  long long int fpos;
+};
+
+bool g_ref_index_cache_loaded = false;
+std::string g_ref_index_cache_path;
+long long int g_ref_index_cache_mtime = 0;
+long long int g_ref_index_cache_size = 0;
+std::map<int, std::vector<RefIndexEntry> > g_ref_index_cache_by_chr;
+
+// Returns false if the file cannot be stat'd (e.g. missing/unreadable); in that case
+// EnsureReferenceIndexCache proceeds to bgzf_open, which raises the usual clear error.
+bool StatFile(const std::string& path, long long int& mtime_out, long long int& size_out) {
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) {
+    return false;
+  }
+  mtime_out = static_cast<long long int>(st.st_mtime);
+  size_out = static_cast<long long int>(st.st_size);
+  return true;
+}
+
+void EnsureReferenceIndexCache(const std::string& reference_index_file) {
+  long long int mtime = 0, size = 0;
+  const bool have_stat = StatFile(reference_index_file, mtime, size);
+
+  // Re-use the cache only if it was loaded from this exact path AND (when stat succeeds)
+  // the file's mtime/size still match what was cached, so an in-place regenerated file
+  // at the same path is picked up instead of silently serving stale data.
+  if (g_ref_index_cache_loaded &&
+      g_ref_index_cache_path == reference_index_file &&
+      (!have_stat || (mtime == g_ref_index_cache_mtime && size == g_ref_index_cache_size))) {
+    return;
+  }
+
   Rcpp::Rcout << "Reading reference index...";
   Rcpp::Rcout.flush();  // Ensure immediate printing
-  
-  // Declare iterators for finding SNPs in the map
-  std::map<MapKey, Snp*, LessThanMapKey>::iterator it1;
-  std::map<MapKey, Snp*, LessThanMapKey>::iterator it2;
-  
-  // Open the reference index file using BGZF format (compressed)
-  std::string reference_index_file = args.reference_index_file;
-  BGZF* fp = bgzf_open(reference_index_file.c_str(), "r"); // Open for reading
-  
-  // Check if the file was successfully opened, otherwise stop with an error
+
+  BGZF* fp = bgzf_open(reference_index_file.c_str(), "r");
   if (!fp) {
     Rcpp::stop("ERROR: can't open reference index file '" + reference_index_file + "'");
   }
-  
+
+  std::map<int, std::vector<RefIndexEntry> > cache_by_chr;
+
   int last_char;
   std::string line;
-  
-  // SNP data variables
-  std::string rsid, a1, a2;    // SNP ID and alleles
-  int chr;                     // Chromosome number
-  double af1ref;               // Reference allele frequency (not used in this function)
-  long long int bp, fpos;      // Base pair position and `fpos` stores the file position in the reference panel data
-  Snp* snp;                    // Pointer to an Snp object
-  
-  // Loop to read each line from the reference index file
+  std::string rsid, a1, a2;
+  int chr;
+  double af1ref;             // Reference allele frequency (unused by ReadReferenceIndex)
+  long long int bp, fpos;
+
   while (true) {
-    
-    last_char = BgzfGetLine(fp, line); // Read a line from the file
-    if (last_char == -1)  // Check if end of file (EOF)
-      break;              // Exit loop if EOF is reached
-    
-    // Parse the line into SNP variables (rsid, chr, bp, a1, a2, af1ref, fpos)
+    last_char = BgzfGetLine(fp, line);
+    if (last_char == -1)
+      break;
+
     std::istringstream buffer(line);
     buffer >> rsid >> chr >> bp >> a1 >> a2 >> af1ref >> fpos;
-    
-    // Filter SNPs by chromosome if specified (args.chr > 0)
-    if ((args.chr > 0) && (args.chr != chr)) 
-      continue; // Skip SNPs that are not on the specified chromosome
-    
-    // Filter SNPs by base pair position (start_bp - wing_size to end_bp + wing_size)
-    if ((args.start_bp - args.wing_size) > bp || (args.end_bp + args.wing_size) < bp)
-      continue; // Skip SNPs outside the desired base pair range
-    
-    // Create keys for SNP (both possible allele orders: a1/a2 and a2/a1)
-    MapKey mkey1(chr, bp, a1, a2);
-    MapKey mkey2(chr, bp, a2, a1);
-    
-    // Find SNP in snp_map using both possible keys
-    it1 = snp_map.find(mkey1);
-    it2 = snp_map.find(mkey2);
-    
-    // Case 1: SNP found with key mkey1 (alleles in correct order, i.e., a1=a1 & a2=a2)
-    if ((it1 != snp_map.end()) && (it2 == snp_map.end())) {
-      // Update existing SNP object with reference data
-      (it1->second)->SetRsid(rsid);        // Set the reference rsid
-      (it1->second)->SetType(1);           // Type 1: Measured SNP that exists in the reference panel
-      (it1->second)->SetFpos(fpos);        // Set file position (fpos) in reference panel data
-      
-      // Case 2: SNP found with key mkey2 (alleles in reverse order, i.e., a1=a2 & a2=a1)
-      // Here, I am updating the alleles in the snp_map to match the reference panel alleles (i.e., a1 and a2),
-      // Therefore, I do not need to flip the genotypes in the reference panel. 
-    } else if ((it1 == snp_map.end()) && (it2 != snp_map.end())) {
-      // Update SNP object with swapped alleles
-      (it2->second)->SetRsid(rsid);        // Set the reference rsid
-      (it2->second)->SetA1(a1);            // Set allele 1
-      (it2->second)->SetA2(a2);            // Set allele 2
-      (it2->second)->SetZ((it2->second)->GetZ() * (-1));  // Reverse Z-score
-      (it2->second)->SetType(1);           // Type 1: Measured SNP that exists in the reference panel
-      (it2->second)->SetFpos(fpos);        // Set file position (fpos) in reference panel data
-      
-      // Modify the key in the map
-      MapKey new_key(chr, bp, a1, a2);     // Create new key with updated allele order
-      snp_map[new_key] = it2->second;      // Insert SNP with new key
-      snp_map.erase(it2);                  // Remove the old key (reverse alleles)
-      
-      // Case 3: SNP not found in snp_map (new SNP from reference panel)
-    } else if (it1 == snp_map.end() && it2 == snp_map.end()) {
-      // Create a new SNP object for the unmeasured SNP in the reference panel
-      snp = new Snp();
-      snp->SetRsid(rsid);                  // Set the reference rsid
-      snp->SetChr(chr);                    // Set the chromosome number
-      snp->SetBp(bp);                      // Set the base pair position
-      snp->SetA1(a1);                      // Set allele 1
-      snp->SetA2(a2);                      // Set allele 2
-      snp->SetType(0);                     // Type 0: Unmeasured SNP that exists in the reference panel
-      snp->SetFpos(fpos);                  // Set file position (fpos) in reference panel data
-      
-      // Add the new SNP to the map
-      snp_map[mkey1] = snp;
-      
-      // Case 4: Duplicates found (this should not happen, error case)
-    } else {
-      // Throw error message if duplicates are found
-      Rcpp::stop("ERROR: input file contains duplicates");
-    }
-  } // End of while loop
-  
-  // Close the BGZF file after reading
+
+    RefIndexEntry entry;
+    entry.rsid = rsid;
+    entry.bp = bp;
+    entry.a1 = a1;
+    entry.a2 = a2;
+    entry.fpos = fpos;
+    cache_by_chr[chr].push_back(entry);
+  }
+
   bgzf_close(fp);
-  
-  // Print newline to indicate completion
+
+  // Trim excess vector capacity accumulated from repeated push_back growth,
+  // since a genome-wide index can hold tens of millions of entries.
+  for (std::map<int, std::vector<RefIndexEntry> >::iterator it = cache_by_chr.begin();
+       it != cache_by_chr.end(); ++it) {
+    it->second.shrink_to_fit();
+  }
+
+  g_ref_index_cache_by_chr.swap(cache_by_chr);
+  g_ref_index_cache_loaded = true;
+  g_ref_index_cache_path = reference_index_file;
+  g_ref_index_cache_mtime = mtime;
+  g_ref_index_cache_size = size;
+
   Rcpp::Rcout << std::endl;
+}
+
+}  // namespace
+
+void ReadReferenceIndex(std::map<MapKey, Snp*, LessThanMapKey>& snp_map, Arguments& args) {
+
+  EnsureReferenceIndexCache(args.reference_index_file);
+
+  // Declare iterators for finding SNPs in the map
+  std::map<MapKey, Snp*, LessThanMapKey>::iterator it1;
+  std::map<MapKey, Snp*, LessThanMapKey>::iterator it2;
+
+  Snp* snp;                    // Pointer to an Snp object
+
+  // Restrict the scan to the requested chromosome's bucket when one is specified;
+  // otherwise (args.chr <= 0) fall back to scanning every chromosome's bucket.
+  std::map<int, std::vector<RefIndexEntry> >::const_iterator chr_begin, chr_end;
+  if (args.chr > 0) {
+    chr_begin = g_ref_index_cache_by_chr.find(args.chr);
+    chr_end = chr_begin;
+    if (chr_begin != g_ref_index_cache_by_chr.end()) {
+      ++chr_end;
+    }
+  } else {
+    chr_begin = g_ref_index_cache_by_chr.begin();
+    chr_end = g_ref_index_cache_by_chr.end();
+  }
+
+  for (std::map<int, std::vector<RefIndexEntry> >::const_iterator chr_it = chr_begin; chr_it != chr_end; ++chr_it) {
+    const int chr = chr_it->first;
+    const std::vector<RefIndexEntry>& entries = chr_it->second;
+
+    for (std::vector<RefIndexEntry>::const_iterator ent = entries.begin(); ent != entries.end(); ++ent) {
+      const long long int bp = ent->bp;
+
+      // Filter SNPs by base pair position (start_bp - wing_size to end_bp + wing_size)
+      if ((args.start_bp - args.wing_size) > bp || (args.end_bp + args.wing_size) < bp)
+        continue; // Skip SNPs outside the desired base pair range
+
+      const std::string& rsid = ent->rsid;
+      const std::string& a1 = ent->a1;
+      const std::string& a2 = ent->a2;
+      const long long int fpos = ent->fpos;
+
+      // Create keys for SNP (both possible allele orders: a1/a2 and a2/a1)
+      MapKey mkey1(chr, bp, a1, a2);
+      MapKey mkey2(chr, bp, a2, a1);
+
+      // Find SNP in snp_map using both possible keys
+      it1 = snp_map.find(mkey1);
+      it2 = snp_map.find(mkey2);
+
+      // Case 1: SNP found with key mkey1 (alleles in correct order, i.e., a1=a1 & a2=a2)
+      if ((it1 != snp_map.end()) && (it2 == snp_map.end())) {
+        // Update existing SNP object with reference data
+        (it1->second)->SetRsid(rsid);        // Set the reference rsid
+        (it1->second)->SetType(1);           // Type 1: Measured SNP that exists in the reference panel
+        (it1->second)->SetFpos(fpos);        // Set file position (fpos) in reference panel data
+
+        // Case 2: SNP found with key mkey2 (alleles in reverse order, i.e., a1=a2 & a2=a1)
+        // Here, I am updating the alleles in the snp_map to match the reference panel alleles (i.e., a1 and a2),
+        // Therefore, I do not need to flip the genotypes in the reference panel.
+      } else if ((it1 == snp_map.end()) && (it2 != snp_map.end())) {
+        // Update SNP object with swapped alleles
+        (it2->second)->SetRsid(rsid);        // Set the reference rsid
+        (it2->second)->SetA1(a1);            // Set allele 1
+        (it2->second)->SetA2(a2);            // Set allele 2
+        (it2->second)->SetZ((it2->second)->GetZ() * (-1));  // Reverse Z-score
+        (it2->second)->SetType(1);           // Type 1: Measured SNP that exists in the reference panel
+        (it2->second)->SetFpos(fpos);        // Set file position (fpos) in reference panel data
+
+        // Modify the key in the map
+        MapKey new_key(chr, bp, a1, a2);     // Create new key with updated allele order
+        snp_map[new_key] = it2->second;      // Insert SNP with new key
+        snp_map.erase(it2);                  // Remove the old key (reverse alleles)
+
+        // Case 3: SNP not found in snp_map (new SNP from reference panel)
+      } else if (it1 == snp_map.end() && it2 == snp_map.end()) {
+        // Create a new SNP object for the unmeasured SNP in the reference panel
+        snp = new Snp();
+        snp->SetRsid(rsid);                  // Set the reference rsid
+        snp->SetChr(chr);                    // Set the chromosome number
+        snp->SetBp(bp);                      // Set the base pair position
+        snp->SetA1(a1);                      // Set allele 1
+        snp->SetA2(a2);                      // Set allele 2
+        snp->SetType(0);                     // Type 0: Unmeasured SNP that exists in the reference panel
+        snp->SetFpos(fpos);                  // Set file position (fpos) in reference panel data
+
+        // Add the new SNP to the map
+        snp_map[mkey1] = snp;
+
+        // Case 4: Duplicates found (this should not happen, error case)
+      } else {
+        // Throw error message if duplicates are found
+        Rcpp::stop("ERROR: input file contains duplicates");
+      }
+    } // End of entries loop
+  } // End of chromosome bucket loop
 }
 
 
