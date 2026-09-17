@@ -50,7 +50,7 @@ write_prscs_ld_chr <- function(chr,
                                reference_index_file,
                                reference_data_file,
                                reference_pop_desc_file,
-                               block_size = 3e6,
+                               block_size = 250000,
                                maf_cutoff = 0.01,
                                missing_cutoff = 1.0,
                                shrinkage = 0,
@@ -287,7 +287,7 @@ finalize_prscs_snpinfo <- function(panel_dir,
 #'   superpopulation_label = "EUR",
 #'   output_dir = "prscs_ref",
 #'   chromosomes = 22,
-#'   block_size = 3e6,
+#'   block_size = 250000,
 #'   shrinkage = 0.01
 #' )
 #' }
@@ -297,7 +297,7 @@ generate_prscs_ld_panel <- function(reference_index_file,
                                     superpopulation_label,
                                     output_dir,
                                     chromosomes = 1:22,
-                                    block_size = 3e6,
+                                    block_size = 250000,
                                     maf_cutoff = 0.01,
                                     missing_cutoff = 1.0,
                                     shrinkage = 0,
@@ -488,8 +488,10 @@ generate_prscs_ld_panel <- function(reference_index_file,
 }
 
 .read_gauss_index <- function(reference_index_file) {
+  con <- gzfile(reference_index_file, open = "rt")
+  on.exit(close(con))
   idx <- utils::read.table(
-    gzfile(reference_index_file, open = "rt"),
+    con,
     header = FALSE,
     sep = "",
     stringsAsFactors = FALSE,
