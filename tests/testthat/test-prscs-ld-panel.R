@@ -322,6 +322,256 @@ test_that("dry_run returns block boundaries and raw SNP counts without touching 
   expect_false(dir.exists(file.path(td, "prscs_ref")))
 })
 
+# generate_prscs_ld_panels (multi-population reconciliation) -----------------
+
+# Simulates the real bug: the same nominal maf_cutoff retains a different SNP
+# set per population because MAF is computed from that population's own
+# allele frequency. EUR here drops rs4 (population-specific MAF), AFR drops
+# rs1 -- so an unreconciled build would leave EUR with {rs1,rs2,rs3} and AFR
+# with {rs2,rs3,rs4} in the same block, misaligning block-index-based mixing.
+.mock_compute_superpop_ld_window_by_pop <- function(chr, start_bp, end_bp, superpopulation_label,
+                                                     reference_index_file, reference_data_file,
+                                                     reference_pop_desc_file, maf_cutoff = NULL,
+                                                     missing_cutoff = NULL) {
+  pool <- data.frame(
+    rsid = c("rs1", "rs2", "rs3", "rs4", "rs5"),
+    chr = rep(1L, 5),
+    bp = c(10L, 20L, 30L, 40L, 500L),
+    a1 = c("A", "C", "G", "T", "A"),
+    a2 = c("G", "T", "A", "C", "G"),
+    af1pop = c(0.05, 0.2, 0.3, 0.05, 0.2),
+    stringsAsFactors = FALSE
+  )
+  sub <- pool[pool$chr == chr & pool$bp >= start_bp & pool$bp <= end_bp, , drop = FALSE]
+
+  if (identical(superpopulation_label, "EUR")) {
+    sub <- sub[sub$rsid != "rs4", , drop = FALSE]
+  } else if (identical(superpopulation_label, "AFR")) {
+    sub <- sub[sub$rsid != "rs1", , drop = FALSE]
+  }
+
+  if (nrow(sub) == 0) {
+    stop("No SNPs found in requested region for provided reference index.")
+  }
+  if (nrow(sub) < 2) {
+    stop("Fewer than 2 SNPs remain after missingness/MAF filtering.")
+  }
+  m <- nrow(sub)
+  cormat <- matrix(0.3, m, m)
+  diag(cormat) <- 1
+  list(snplist = sub, cormat = cormat)
+}
+
+test_that("generate_prscs_ld_panels reconciles per-population MAF-driven SNP mismatches", {
+  skip_if_not_installed("hdf5r")
+
+  td <- tempfile("gausstest"); dir.create(td)
+  idx_path <- file.path(td, "toy_index.gz")
+  geno_path <- file.path(td, "toy_geno.gz")
+  pop_desc_path <- file.path(td, "toy_pop_desc.txt")
+  output_dir <- file.path(td, "prscs_ref")
+  dir.create(output_dir)
+
+  snp_pool <- data.frame(
+    rsid = c("rs1", "rs2", "rs3", "rs4", "rs5"),
+    chr = rep(1L, 5),
+    bp = c(10L, 20L, 30L, 40L, 500L),
+    a1 = c("A", "C", "G", "T", "A"),
+    a2 = c("G", "T", "A", "C", "G"),
+    af1pop = c(0.05, 0.2, 0.3, 0.05, 0.2),
+    stringsAsFactors = FALSE
+  )
+  .write_toy_index(idx_path, snp_pool = snp_pool)
+  .write_dummy_file(geno_path)
+  .write_toy_pop_desc(pop_desc_path)
+
+  testthat::local_mocked_bindings(
+    computeSuperPopLDWindow = .mock_compute_superpop_ld_window_by_pop
+  )
+
+  # bp range 10..500, block_size=100 -> blk_1=[10,109] holds rs1..rs4,
+  # blk_5=[410,509] holds rs5 alone; blk_2..blk_4 are empty for everyone.
+  panel_dirs <- generate_prscs_ld_panels(
+    reference_index_file = idx_path,
+    reference_data_file = geno_path,
+    reference_pop_desc_file = pop_desc_path,
+    superpopulation_labels = c("EUR", "AFR"),
+    output_dir = output_dir,
+    chromosomes = 1,
+    block_size = 100,
+    verbose = FALSE
+  )
+
+  expect_setequal(names(panel_dirs), c("EUR", "AFR"))
+  expect_equal(basename(panel_dirs$EUR), "ldblk_1kg_eur33kg")
+  expect_equal(basename(panel_dirs$AFR), "ldblk_1kg_afr33kg")
+
+  h5_eur <- hdf5r::H5File$new(file.path(panel_dirs$EUR, "ldblk_1kg_chr1.hdf5"), mode = "r")
+  on.exit(h5_eur$close_all(), add = TRUE)
+  h5_afr <- hdf5r::H5File$new(file.path(panel_dirs$AFR, "ldblk_1kg_chr1.hdf5"), mode = "r")
+  on.exit(h5_afr$close_all(), add = TRUE)
+
+  # Reconciled: only the intersection {rs2, rs3} survives in blk_1 for BOTH
+  # populations, not EUR's unreconciled {rs1,rs2,rs3} or AFR's {rs2,rs3,rs4}.
+  expect_equal(h5_eur[["blk_1"]][["snplist"]]$read(), c("rs2", "rs3"))
+  expect_equal(h5_afr[["blk_1"]][["snplist"]]$read(), c("rs2", "rs3"))
+  expect_equal(h5_eur[["blk_1"]]$attr_open("m_snps")$read(), 2L)
+  expect_equal(h5_afr[["blk_1"]]$attr_open("m_snps")$read(), 2L)
+  expect_equal(dim(h5_eur[["blk_1"]][["ldblk"]]$read()), c(2L, 2L))
+  expect_equal(dim(h5_afr[["blk_1"]][["ldblk"]]$read()), c(2L, 2L))
+
+  # blk_5 (rs5 alone) has <2 SNPs in every population -> stub block in both.
+  expect_equal(h5_eur[["blk_5"]]$attr_open("m_snps")$read(), 0L)
+  expect_equal(h5_afr[["blk_5"]]$attr_open("m_snps")$read(), 0L)
+
+  snpinfo_eur <- read.table(file.path(panel_dirs$EUR, "snpinfo_1kg_hm3"), header = TRUE, stringsAsFactors = FALSE)
+  snpinfo_afr <- read.table(file.path(panel_dirs$AFR, "snpinfo_1kg_hm3"), header = TRUE, stringsAsFactors = FALSE)
+  expect_setequal(snpinfo_eur$SNP, c("rs2", "rs3"))
+  expect_setequal(snpinfo_afr$SNP, c("rs2", "rs3"))
+})
+
+test_that("generate_prscs_ld_panels disambiguates duplicate/placeholder rsids by (bp, a1, a2)", {
+  skip_if_not_installed("hdf5r")
+
+  # Two distinct physical SNPs both use the common un-annotated-variant
+  # placeholder rsid "." at different bp -- a real-world pattern in
+  # 1000-Genomes-style reference panels. AFR drops the bp=10 "." SNP (as if
+  # by population-specific MAF filtering) but keeps the bp=20 one; EUR keeps
+  # both. Reconciling on rsid alone would intersect "." to a single entry
+  # and, via match()'s first-occurrence semantics, silently pair EUR's bp=10
+  # SNP with AFR's bp=20 SNP in the same block position.
+  .mock_dup_rsid <- function(chr, start_bp, end_bp, superpopulation_label,
+                             reference_index_file, reference_data_file,
+                             reference_pop_desc_file, maf_cutoff = NULL,
+                             missing_cutoff = NULL) {
+    pool <- data.frame(
+      rsid = c(".", ".", "rs3"),
+      chr = rep(1L, 3),
+      bp = c(10L, 20L, 30L),
+      a1 = c("A", "C", "G"),
+      a2 = c("G", "T", "A"),
+      af1pop = c(0.2, 0.2, 0.2),
+      stringsAsFactors = FALSE
+    )
+    sub <- pool[pool$chr == chr & pool$bp >= start_bp & pool$bp <= end_bp, , drop = FALSE]
+    if (identical(superpopulation_label, "AFR")) {
+      sub <- sub[sub$bp != 10L, , drop = FALSE]
+    }
+    if (nrow(sub) < 2) {
+      stop("Fewer than 2 SNPs remain after missingness/MAF filtering.")
+    }
+    m <- nrow(sub)
+    cormat <- matrix(0.3, m, m)
+    diag(cormat) <- 1
+    list(snplist = sub, cormat = cormat)
+  }
+
+  td <- tempfile("gausstest"); dir.create(td)
+  idx_path <- file.path(td, "toy_index.gz")
+  geno_path <- file.path(td, "toy_geno.gz")
+  pop_desc_path <- file.path(td, "toy_pop_desc.txt")
+  output_dir <- file.path(td, "prscs_ref")
+  dir.create(output_dir)
+
+  snp_pool <- data.frame(
+    rsid = c(".", ".", "rs3"),
+    chr = rep(1L, 3),
+    bp = c(10L, 20L, 30L),
+    a1 = c("A", "C", "G"),
+    a2 = c("G", "T", "A"),
+    af1pop = c(0.2, 0.2, 0.2),
+    stringsAsFactors = FALSE
+  )
+  .write_toy_index(idx_path, snp_pool = snp_pool)
+  .write_dummy_file(geno_path)
+  .write_toy_pop_desc(pop_desc_path)
+
+  testthat::local_mocked_bindings(
+    computeSuperPopLDWindow = .mock_dup_rsid
+  )
+
+  panel_dirs <- generate_prscs_ld_panels(
+    reference_index_file = idx_path,
+    reference_data_file = geno_path,
+    reference_pop_desc_file = pop_desc_path,
+    superpopulation_labels = c("EUR", "AFR"),
+    output_dir = output_dir,
+    chromosomes = 1,
+    block_size = 100,
+    verbose = FALSE
+  )
+
+  h5_eur <- hdf5r::H5File$new(file.path(panel_dirs$EUR, "ldblk_1kg_chr1.hdf5"), mode = "r")
+  on.exit(h5_eur$close_all(), add = TRUE)
+  h5_afr <- hdf5r::H5File$new(file.path(panel_dirs$AFR, "ldblk_1kg_chr1.hdf5"), mode = "r")
+  on.exit(h5_afr$close_all(), add = TRUE)
+
+  # Reconciled on (bp, a1, a2): only the bp=20 "." SNP and rs3 are common to
+  # both populations -- the bp=10 "." SNP (EUR-only) must NOT be paired with
+  # AFR's bp=20 "." SNP just because they share the placeholder rsid.
+  expect_equal(h5_eur[["blk_1"]][["bp"]]$read(), c(20L, 30L))
+  expect_equal(h5_afr[["blk_1"]][["bp"]]$read(), c(20L, 30L))
+  expect_equal(h5_eur[["blk_1"]]$attr_open("m_snps")$read(), 2L)
+  expect_equal(h5_afr[["blk_1"]]$attr_open("m_snps")$read(), 2L)
+})
+
+test_that("generate_prscs_ld_panels validation requires at least 2 superpopulation labels", {
+  td <- tempfile("gausstest"); dir.create(td)
+  idx_path <- file.path(td, "toy_index.gz")
+  geno_path <- file.path(td, "toy_geno.gz")
+  pop_desc_path <- file.path(td, "toy_pop_desc.txt")
+  .write_toy_index(idx_path)
+  .write_dummy_file(geno_path)
+  .write_toy_pop_desc(pop_desc_path)
+
+  expect_error(
+    generate_prscs_ld_panels(
+      reference_index_file = idx_path,
+      reference_data_file = geno_path,
+      reference_pop_desc_file = pop_desc_path,
+      superpopulation_labels = "EUR",
+      output_dir = file.path(td, "prscs_ref"),
+      verbose = FALSE
+    ),
+    "2 or more"
+  )
+})
+
+test_that("generate_prscs_ld_panels validation reports a missing reference_data_file/reference_pop_desc_file", {
+  td <- tempfile("gausstest"); dir.create(td)
+  idx_path <- file.path(td, "toy_index.gz")
+  .write_toy_index(idx_path)
+
+  expect_error(
+    generate_prscs_ld_panels(
+      reference_index_file = idx_path,
+      reference_data_file = "does_not_exist.gz",
+      reference_pop_desc_file = "does_not_exist.txt",
+      superpopulation_labels = c("EUR", "AFR"),
+      output_dir = file.path(td, "prscs_ref"),
+      verbose = FALSE
+    ),
+    "Reference genotype file does not exist"
+  )
+
+  pop_desc_path <- file.path(td, "toy_pop_desc.txt")
+  .write_toy_pop_desc(pop_desc_path)
+  geno_path <- file.path(td, "toy_geno.gz")
+  .write_dummy_file(geno_path)
+
+  expect_error(
+    generate_prscs_ld_panels(
+      reference_index_file = idx_path,
+      reference_data_file = geno_path,
+      reference_pop_desc_file = "does_not_exist.txt",
+      superpopulation_labels = c("EUR", "AFR"),
+      output_dir = file.path(td, "prscs_ref"),
+      verbose = FALSE
+    ),
+    "Reference population description file does not exist"
+  )
+})
+
 # Argument validation --------------------------------------------------------
 
 test_that("generate_prscs_ld_panel validation reports a missing reference_index_file", {
